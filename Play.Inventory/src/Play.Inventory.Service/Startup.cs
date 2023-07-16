@@ -1,11 +1,19 @@
+using System;
+using System.Net.Http;
+using DnsClient.Internal;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Microsoft.OpenApi.Models;
 using Play.Common.Repositories;
+using Play.Inventory.Service.Clients;
 using Play.Inventory.Service.Entities;
+using Polly;
+using Polly.Extensions.Http;
+using Polly.Timeout;
 
 namespace Play.Inventory.Service
 {
@@ -22,6 +30,36 @@ namespace Play.Inventory.Service
         public void ConfigureServices(IServiceCollection services)
         {
             services.AddMongo().AddMongoRepository<InventoryItem>("inventoryitems");
+
+            Random jitterer = new Random();
+
+            services.AddHttpClient<CatalogClient>(client =>
+            {
+                client.BaseAddress = new Uri("https://localhost:5001");
+            })
+            .AddPolicyHandler((serviceProvider, request) => Policy.WrapAsync(
+                HttpPolicyExtensions.HandleTransientHttpError().Or<TimeoutRejectedException>().WaitAndRetryAsync(
+                    retryCount: 5,
+                    sleepDurationProvider: retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)) + TimeSpan.FromMilliseconds(jitterer.Next(0, 1000)),
+                    onRetry: (outcome, timespan, retryCount, context) =>
+                    {
+                        serviceProvider.GetService<ILogger<CatalogClient>>().LogWarning($"Delaying for {timespan.TotalSeconds} seconds, then making retry {retryCount}");
+                    }
+                ),
+                HttpPolicyExtensions.HandleTransientHttpError().Or<TimeoutRejectedException>().CircuitBreakerAsync(
+                    handledEventsAllowedBeforeBreaking: 3,
+                    durationOfBreak: TimeSpan.FromSeconds(15),
+                    onBreak: (outcome, timespan) =>
+                    {
+                        serviceProvider.GetService<ILogger<CatalogClient>>().LogWarning($"Opening the circuit for {timespan.TotalSeconds} seconds...");
+                    },
+                    onReset: () =>
+                    {
+                        serviceProvider.GetService<ILogger<CatalogClient>>().LogWarning($"Closing the circuit...");
+                    }
+                ),
+                Policy.TimeoutAsync<HttpResponseMessage>(1)
+            ));
 
             services.AddControllers();
             services.AddSwaggerGen(c =>
